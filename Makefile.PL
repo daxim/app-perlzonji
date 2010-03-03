@@ -7,6 +7,11 @@ readme_markdown_from_pod;
 auto_set_homepage;
 auto_set_bugtracker;
 auto_set_repository;
+requires 'File::BaseDir' => '0.03',
+requires 'File::Next'    => '1.06',
+requires 'File::Slurp'   => '9999.13',
+requires 'KinoSearch'    => '0.165';
+requires 'Path::Class'   => '0.18';
 requires 'Pod::Usage::CommandLine' => '0.04';
 test_requires 'Test::More' => '0.70';
 extra_tests;

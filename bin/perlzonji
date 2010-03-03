@@ -1,13 +1,19 @@
 #!/usr/bin/env perl
 use warnings;
 use strict;
+use App::perlzonji qw();
 use Pod::Usage::CommandLine qw(GetOptions pod2usage);
 our $VERSION = '0.03';
 
 my %opt = (
     'perldoc-command' => 'perldoc',
 );
-GetOptions(\%opt, 'perldoc-command:s', 'debug') or pod2usage(2);
+GetOptions(\%opt, 'perldoc-command:s', 'debug', 'build-search-index:s') or pod2usage(2);
+
+if (exists $opt{'build-search-index'}) {
+    App::perlzonji::build_search_index($opt{'build-search-index'});
+    exit;
+}
 
 my $word = shift @ARGV;
 
@@ -107,8 +113,11 @@ try_module($word);
 # that again as a module
 $word =~ s/::(\w+)$// && try_module($word);
 
-# otherwise, assume it's a function
-run($opt{'perldoc-command'}, qw(-f), $word);
+# assume it's a function
+exit if 0 == system $opt{'perldoc-command'}, qw(-f), $word;
+
+# perldoc failed, try full text search as last resort
+try_module(App::perlzonji::module_name_from_query($word));
 
 # if we can require() it, we run perldoc for the module
 sub try_module {
@@ -164,6 +173,10 @@ C<annopod> from L<AnnoCPAN::Perldoc> is a better alternative.
 =item C<--debug>
 
 Prints the whole command before executing it.
+
+=item C<--build-search-index>
+
+See L<App::perlzonji/"build_search_index">. Takes an optional directory name.
 
 =item C<--help>
 
