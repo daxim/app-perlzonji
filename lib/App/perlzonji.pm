@@ -5,6 +5,14 @@ use warnings;
 package App::perlzonji;
 
 # ABSTRACT: a more knowledgeable perldoc
+use File::BaseDir qw(xdg_cache_home);
+use File::Next qw();
+use File::Path qw(make_path);
+use File::Slurp qw(read_file);
+use KinoSearch1::Analysis::PolyAnalyzer qw();
+use KinoSearch1::InvIndexer qw();
+use KinoSearch1::Searcher qw();
+use Path::Class qw(dir);
 use Pod::Usage::CommandLine qw(GetOptions pod2usage);
 
 # Specify like this because it's easier. We compute the reverse later (i.e.,
@@ -97,9 +105,15 @@ our %found_in = (
       [qw(:bytes :crlf :mmap :perlio :pop :raw :stdio :unix :utf8 :win32)],
 );
 
+our %opt = ('perldoc-command' => 'perldoc');
+
 sub run {
-    our %opt = ('perldoc-command' => 'perldoc');
-    GetOptions(\%opt, 'perldoc-command:s', 'debug') or pod2usage(2);
+    GetOptions(\%opt, 'perldoc-command:s', 'debug', 'build-search-index:s') or pod2usage(2);
+    if (exists $opt{'build-search-index'}) {
+        build_search_index($opt{'build-search-index'});
+        exit;
+    }
+
     my $word = shift @ARGV;
     while (my ($file, $words) = each our %found_in) {
         $_ eq $word && execute($opt{'perldoc-command'} => $file) for @$words;
@@ -118,23 +132,97 @@ sub run {
     # that again as a module
     $word =~ s/::(\w+)$// && try_module($word);
 
-    # otherwise, assume it's a function
-    execute($opt{'perldoc-command'}, qw(-f), $word);
+    # assume it's a function
+    exit if 0 == subprocess($opt{'perldoc-command'}, qw(-f), $word);
+
+    # perldoc failed, full text search as last resort
+    try_module(module_name_from_query($word));
+
+    exit;
 }
 
 # if we can require() it, we run perldoc for the module
 sub try_module {
     my $module = shift;
-    our %opt;
     eval "use $module;";
     !$@ && execute($opt{'perldoc-command'} => $module);
 }
 
 sub execute {
-    our %opt;
     print "@_\n" if $opt{debug};
     exec @_;
 }
+
+# 'run' already taken, quelle surprise
+sub subprocess {
+    print "@_\n" if $opt{debug};
+    return system @_;
+}
+
+# indexing peculiarities cribbed from Pod::POM::Web::Indexer
+sub build_search_index {
+    my ($index_directory) = @_;
+    $index_directory ||= dir(xdg_cache_home, qw(kinosearch perlpod))->stringify;
+    make_path($index_directory);
+
+    my $invindexer = KinoSearch1::InvIndexer->new(
+        invindex => $index_directory,
+        create   => 1,
+        analyzer => KinoSearch1::Analysis::PolyAnalyzer->new(language => 'en'),
+    );
+    $invindexer->spec_field(
+        name  => 'title',
+        boost => 3,
+    );
+    $invindexer->spec_field(name => 'bodytext');
+
+    my $ignore_dirs = qr[auto | unicore | DateTime/TimeZone | DateTime/Locale]x;
+    my $files = File::Next::files({
+        file_filter => sub {
+            /\. (pm|pod) \z/msx && $File::Next::dir !~ /$ignore_dirs/ && -s ($File::Next::name) < 300_000;
+        },
+        sort_files => 1,
+    }, grep { '.' ne $_ } @INC);
+
+    my $ignore_headings = qr[
+          SYNOPSIS | DESCRIPTION | METHODS   | FUNCTIONS |
+          BUGS     | AUTHOR      | SEE\ ALSO | COPYRIGHT | LICENSE ]x;
+    my %seen;
+    while (defined(my $file = $files->())) {
+        next if exists $seen{$file};    # skip dupes
+        $seen{$file} = undef;
+
+        print "$file\n" if $opt{debug};
+        my $document = read_file $file;
+        my ($title) = ($document =~ /^=head1\s*NAME\s*(.*)$/m);
+        $title ||= '';
+        $title    =~ s/\t/ /g;
+        $document =~ s/^=head1\s+($ignore_headings).*$//m;    # remove full line of those
+        $document =~ s/^=(head\d|item)//mg;                   # just remove command of =head* or =item
+        $document =~ s/^=\w.*//mg;                            # remove full line of all other commands
+
+        my $kino = $invindexer->new_doc;
+        $kino->set_value(title    => $title);
+        $kino->set_value(bodytext => $document);
+        $invindexer->add_doc($kino);
+    }
+
+    $invindexer->finish;
+    return;
+}
+
+sub module_name_from_query {
+    my ($search_term, $index_directory) = @_;
+    $index_directory ||= dir(xdg_cache_home, qw(kinosearch perlpod));
+
+    my $top_hit = KinoSearch1::Searcher->new(
+        invindex => $index_directory,
+        analyzer => KinoSearch1::Analysis::PolyAnalyzer->new(language => 'en'),
+    )->search(query => $search_term)->fetch_hit->get_field_values->{title};
+    $top_hit =~ s{\s .* \z}{}msx; # truncate at first space, leave name at front
+    return $top_hit;
+}
+
 1;
 
 =begin :prelude
@@ -182,6 +270,10 @@ Options can be shortened according to L<Getopt::Long/"Case and abbreviations">.
 Specifies the POD formatter/pager to delegate to. Default is C<perldoc>.
 C<annopod> from L<AnnoCPAN::Perldoc> is a better alternative.
 
+=item C<--build-search-index>
+
+See L</"build_search_index">. Takes an optional directory name.
+
 =item C<--debug>
 
 Prints the whole command before executing it.
@@ -211,3 +303,27 @@ this subroutine does nothing.
 Executes the given command using C<exec()>. In debug mode, it also prints the
 command before executing it.
 
+=function subprocess
+
+Runs and returns from the given command using C<system()>. In debug mode, it
+also prints the command before running it.
+
+=function build_search_index
+
+    build_search_index($index_directory)
+
+Creates a L<KinoSearch1> full-text index. This typically takes about 3 minutes
+and 180 MiB.
+
+Takes an optional directory name where to store the index files. Default is
+F<kinosearch/perlpod/> in the XDG cache home directory.
+
+=function module_name_from_query
+
+    module_name_from_query($search_term, $index_directory)
+
+Returns a module name that is the top result for a search in the full-text
+index.
+
+Takes a mandatory query string. Takes an optional directory name for the index
+files as above.
